@@ -1,0 +1,24 @@
+# OPTIONAL override: NVIDIA hardware transcoding for Plex.
+#
+# Prerequisites on the host (see README "Hardware transcoding"):
+#   - proprietary NVIDIA driver installed and `nvidia-smi` working
+#   - NVIDIA Container Toolkit installed and registered with Docker
+#     (sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker)
+#   - a Plex Pass subscription
+#
+# Enable by adding to .env:
+#   COMPOSE_FILE=docker-compose.yml:compose.nvidia.yml
+# (combine with the VPN override: docker-compose.yml:compose.vpn.yml:compose.nvidia.yml)
+
+services:
+  plex:
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]

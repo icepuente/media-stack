@@ -1,0 +1,291 @@
+# Self-hosted media stack: Plex + Seerr + Radarr + Sonarr + Prowlarr + FlareSolverr + Transmission
+# Optional profiles:  books      -> Calibre-Web-Automated + Shelfmark Lite
+#                     unpackerr  -> automatic extraction of RAR'd releases
+# Optional overrides: compose.vpn.yml     -> route Transmission through a gluetun VPN container
+#                     compose.nvidia.yml  -> NVIDIA hardware transcoding for Plex
+#
+# All settings come from .env (copy .env.example). See README.md for the full walkthrough.
+
+x-common-env: &common-env
+  PUID: ${PUID:-1000}
+  PGID: ${PGID:-1000}
+  TZ: ${TZ:-Etc/UTC}
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+networks:
+  default:
+    name: mediastack
+
+services:
+  # ---------------------------------------------------------------------------
+  # Plex Media Server
+  # Host networking = LAN discovery (GDM), DLNA and remote access work without
+  # extra port juggling. Other containers reach it at host.docker.internal:32400.
+  # ---------------------------------------------------------------------------
+  plex:
+    image: lscr.io/linuxserver/plex:latest
+    container_name: plex
+    network_mode: host
+    environment:
+      <<: *common-env
+      VERSION: docker            # update Plex by pulling a new image, not in-app
+      PLEX_CLAIM: ${PLEX_CLAIM:-} # one-time token from https://www.plex.tv/claim (valid 4 minutes)
+    volumes:
+      - ${CONFIG_ROOT:-./config}/plex:/config
+      - ${DATA_ROOT:-/data}/media:/data/media
+      - ${TRANSCODE_DIR:-./transcode}:/transcode
+    # --- Hardware transcoding (Intel Quick Sync / Arc, AMD) -------------------
+    # Requires Plex Pass. Uncomment if the host has /dev/dri (check: ls -l /dev/dri).
+    # Intel iGPU (Gen 9+) and Intel Arc (A310/A380, kernel 6.2+) work well via VAAPI/QSV.
+    # For NVIDIA use compose.nvidia.yml instead (see README).
+    # devices:
+    #   - /dev/dri:/dev/dri
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:32400/identity > /dev/null || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    <<: [*restart, *logging]
+
+  # ---------------------------------------------------------------------------
+  # Seerr - request front-end (successor of Overseerr/Jellyseerr)
+  # ---------------------------------------------------------------------------
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: seerr
+    init: true
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      LOG_LEVEL: info
+      TZ: ${TZ:-Etc/UTC}
+    volumes:
+      - ${CONFIG_ROOT:-./config}/seerr:/app/config
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${SEERR_PORT:-5055}:5055"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # reach Plex on the host network
+    depends_on:
+      - radarr
+      - sonarr
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://localhost:5055/api/v1/status || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    <<: [*restart, *logging]
+
+  # ---------------------------------------------------------------------------
+  # Radarr (movies) / Sonarr (TV)
+  # Both see the WHOLE data tree at /data so imports are hardlinks/atomic moves.
+  # ---------------------------------------------------------------------------
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      <<: *common-env
+    volumes:
+      - ${CONFIG_ROOT:-./config}/radarr:/config
+      - ${DATA_ROOT:-/data}:/data
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${RADARR_PORT:-7878}:7878"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # for the Plex "Connect" library refresh
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:7878/ping > /dev/null || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    <<: [*restart, *logging]
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      <<: *common-env
+    volumes:
+      - ${CONFIG_ROOT:-./config}/sonarr:/config
+      - ${DATA_ROOT:-/data}:/data
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${SONARR_PORT:-8989}:8989"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8989/ping > /dev/null || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    <<: [*restart, *logging]
+
+  # ---------------------------------------------------------------------------
+  # Prowlarr - indexer manager, pushes indexers to Radarr/Sonarr (and Shelfmark)
+  # ---------------------------------------------------------------------------
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      <<: *common-env
+    volumes:
+      - ${CONFIG_ROOT:-./config}/prowlarr:/config
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${PROWLARR_PORT:-9696}:9696"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9696/ping > /dev/null || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    <<: [*restart, *logging]
+
+  # ---------------------------------------------------------------------------
+  # FlareSolverr - solves Cloudflare challenges for indexers that need it.
+  # Internal only: Prowlarr talks to it at http://flaresolverr:8191
+  # ---------------------------------------------------------------------------
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      LOG_LEVEL: info
+      LOG_HTML: "false"
+      CAPTCHA_SOLVER: none
+      TZ: ${TZ:-Etc/UTC}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8191/health > /dev/null || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    <<: [*restart, *logging]
+
+  # ---------------------------------------------------------------------------
+  # Transmission - torrent client
+  # Only needs the torrents folder, but it is mounted at the SAME path the
+  # *arrs use (/data/torrents) so no remote path mappings are ever needed.
+  # To route it through a VPN, enable compose.vpn.yml (see README).
+  # ---------------------------------------------------------------------------
+  transmission:
+    image: lscr.io/linuxserver/transmission:latest
+    container_name: transmission
+    environment:
+      <<: *common-env
+      USER: ${TRANSMISSION_USER:-}
+      PASS: ${TRANSMISSION_PASS:-}
+      PEERPORT: ${TRANSMISSION_PEER_PORT:-51413}
+    volumes:
+      - ${CONFIG_ROOT:-./config}/transmission:/config
+      - ${DATA_ROOT:-/data}/torrents:/data/torrents
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${TRANSMISSION_PORT:-9091}:9091"
+      - "${TRANSMISSION_PEER_PORT:-51413}:${TRANSMISSION_PEER_PORT:-51413}/tcp"
+      - "${TRANSMISSION_PEER_PORT:-51413}:${TRANSMISSION_PEER_PORT:-51413}/udp"
+    healthcheck:
+      # 401 (auth on) or 409 (missing session id) both mean the RPC server is up
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:9091/transmission/rpc | grep -qE '^(200|401|409)$' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    <<: [*restart, *logging]
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL (profile: unpackerr) - extracts RAR'd downloads for Radarr/Sonarr
+  # Needs the Radarr/Sonarr API keys in .env (available after first boot).
+  # ---------------------------------------------------------------------------
+  unpackerr:
+    image: golift/unpackerr:latest
+    container_name: unpackerr
+    profiles: ["unpackerr"]
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      UN_SONARR_0_URL: http://sonarr:8989
+      UN_SONARR_0_API_KEY: ${SONARR_API_KEY:-}
+      UN_SONARR_0_PATHS_0: /data/torrents/tv
+      UN_RADARR_0_URL: http://radarr:7878
+      UN_RADARR_0_API_KEY: ${RADARR_API_KEY:-}
+      UN_RADARR_0_PATHS_0: /data/torrents/movies
+    volumes:
+      - ${DATA_ROOT:-/data}/torrents:/data/torrents
+    depends_on:
+      - radarr
+      - sonarr
+    <<: [*restart, *logging]
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL (profile: books) - ebook library + request UI
+  #   Shelfmark (search/request) -> Prowlarr -> Transmission -> ingest folder
+  #   -> Calibre-Web-Automated imports into the Calibre library
+  # ---------------------------------------------------------------------------
+  calibre-web-automated:
+    image: crocodilestick/calibre-web-automated:latest
+    container_name: calibre-web-automated
+    profiles: ["books"]
+    environment:
+      <<: *common-env
+      # true = library on NFS/SMB/FUSE (e.g. mergerfs): disables SQLite WAL and uses polling watchers
+      NETWORK_SHARE_MODE: ${CWA_NETWORK_SHARE_MODE:-false}
+    volumes:
+      - ${CONFIG_ROOT:-./config}/cwa:/config
+      - ${DATA_ROOT:-/data}/books-ingest:/cwa-book-ingest # files here are DELETED after import
+      - ${DATA_ROOT:-/data}/media/books:/calibre-library
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${CWA_PORT:-8083}:8083"
+    <<: [*restart, *logging]
+    # (the image ships its own healthcheck)
+
+  shelfmark:
+    image: ghcr.io/calibrain/shelfmark-lite:latest
+    container_name: shelfmark
+    profiles: ["books"]
+    environment:
+      <<: *common-env
+      SEARCH_MODE: universal
+      METADATA_PROVIDER: openlibrary
+      OPENLIBRARY_ENABLED: "true"
+      # Prowlarr as the release source, Transmission as the client
+      PROWLARR_ENABLED: "true"
+      PROWLARR_URL: http://prowlarr:9696
+      PROWLARR_API_KEY: ${PROWLARR_API_KEY:-}
+      PROWLARR_TORRENT_CLIENT: transmission
+      PROWLARR_TORRENT_ACTION: keep            # keep seeding after import
+      TRANSMISSION_URL: http://transmission:9091
+      TRANSMISSION_USERNAME: ${TRANSMISSION_USER:-}
+      TRANSMISSION_PASSWORD: ${TRANSMISSION_PASS:-}
+      TRANSMISSION_CATEGORY: books
+      TRANSMISSION_DOWNLOAD_DIR: /data/torrents/books # must match Transmission's path exactly
+      HARDLINK_TORRENTS: "false"               # copy into ingest (CWA deletes what it imports)
+      DIRECT_DOWNLOAD_ENABLED: "false"
+      BOOKS_OUTPUT_MODE: folder
+      INGEST_DIR: /books
+      USING_EXTERNAL_BYPASSER: "true"
+      EXT_BYPASSER_URL: http://flaresolverr:8191
+      # Log in with your Calibre-Web-Automated account
+      AUTH_METHOD: cwa
+      CWA_DB_PATH: /cwa-config/app.db
+      CALIBRE_WEB_URL: ${CWA_PUBLIC_URL:-http://localhost:8083} # browser-facing CWA link
+    volumes:
+      - ${CONFIG_ROOT:-./config}/shelfmark:/config
+      - ${CONFIG_ROOT:-./config}/cwa:/cwa-config:ro
+      - ${DATA_ROOT:-/data}/books-ingest:/books
+      - ${DATA_ROOT:-/data}/torrents/books:/data/torrents/books
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${SHELFMARK_PORT:-8084}:8084"
+    depends_on:
+      prowlarr:
+        condition: service_started
+      calibre-web-automated:
+        condition: service_healthy
+    <<: [*restart, *logging]
+    # (the image ships its own healthcheck)

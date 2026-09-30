@@ -1,0 +1,14 @@
+# Secrets and local settings
+.env
+*.env
+!.env.example
+
+# App state (databases, API keys, logs)
+config/
+transcode/
+backups/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
